@@ -15,10 +15,16 @@ public enum AmphionError: Error {
 typealias OperationUpdate<TResponse> = (AmphionOperationState<TResponse>) -> Void;
 typealias Cancellable = () -> Void;
 
+struct RequestBody<Variables>: Encodable where Variables: Encodable {
+    var operationName: String;
+    var query: String;
+    var variables: Variables;
+}
+
 public struct Network {
     private(set) var endpoint: URL;
-    private(set) var onRequest: ((URLRequest) -> URLRequest)?;
-    private(set) var session: URLSession;
+    private var onRequest: ((URLRequest) -> URLRequest)?;
+    private var session: URLSession;
     
     public init(endpoint: URL, onRequest: ((URLRequest) -> URLRequest)?) {
         self.endpoint = endpoint;
@@ -26,31 +32,35 @@ public struct Network {
         self.session = URLSession.shared;
     }
     
-    func handleOperation<TResponse, TVariables>(
-        operation: Operation<TResponse, TVariables>,
-        variables: TVariables?,
-        onUpdate: @escaping OperationUpdate<TResponse>
-    ) -> Cancellable where TVariables: Codable {
+    func handleOperation<TOperation: Operation>(
+        operation: TOperation,
+        onUpdate: @escaping OperationUpdate<TOperation.TResponse>
+    ) -> Cancellable where TOperation.TVariables: Encodable {
         var request = URLRequest(url: endpoint);
         request.httpMethod = "POST";
-        request.addValue("application/json", forHTTPHeaderField: "Content-Type");
-        
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: [
-            "query": operation.id ?? operation.text,
-            "variables": variables ?? nil,
-        ]) else {
-            onUpdate(AmphionOperationState.Failed(AmphionError.jsonSerialization));
+        request.addValue("application/json", forHTTPHeaderField: "content-type");
+        let json = RequestBody(operationName: operation.operationName, query: (operation.id ?? operation.text)!, variables: operation.variables);
+        guard let jsonData = try? JSONEncoder().encode(json) else {
+            onUpdate(AmphionOperationState.Failed(AmphionError.jsonDeserialization));
             return {
                 
             };
         }
+        NSLog(String(data: jsonData, encoding: .utf8)!);
         request.httpBody = jsonData;
         
         let task = self.session.dataTask(with: self.onRequest != nil ? self.onRequest!(request) : request) { data, response, error in
                 DispatchQueue.main.async {
-                    guard let _data = data, error == nil else {
+                    if error != nil {
                         onUpdate(AmphionOperationState.Failed(AmphionError.networkError(404)));
-                        return;
+                    } else if let data = data {
+                        if let response = try? operation.factory(json: data) {
+                            onUpdate(AmphionOperationState.Complete(response));
+                        } else {
+                            onUpdate(AmphionOperationState.Failed(AmphionError.jsonDeserialization));
+                        }
+                    } else {
+                        onUpdate(AmphionOperationState.Failed(AmphionError.networkError(0)));
                     }
                 }
             }
@@ -62,13 +72,15 @@ public struct Network {
 }
 
 public struct Store {
-    
+    public init() {
+        
+    }
 }
 
 @available(iOS 14, *)
 public class Environment: ObservableObject {
-    @Published private(set) var network: Network;
-    @Published private(set) var store: Store;
+    @Published var network: Network;
+    @Published var store: Store;
     
     public init(network: Network, store: Store) {
         self.network = network;
@@ -87,34 +99,58 @@ public enum AmphionOperationState<TResponse> {
     case Failed(AmphionError)
 }
 
-public struct Operation<TResponse, TVariables> where TVariables: Codable {
-    private(set) var type: AmphionOperationType;
-    private(set) var factory: (String) -> TResponse;
-    private(set) var variables: TVariables?;
-    private(set) var text: String?;
-    private(set) var id: String?;
+public protocol Operation {
+    associatedtype TResponse = Decodable;
+    associatedtype TVariables = Encodable;
+    
+    var operationName: String { get };
+    var type: AmphionOperationType { get };
+    func factory(json: Data) throws -> TResponse;
+    var variables: TVariables { get };
+    var text: String? { get };
+    var id: String? { get };
 }
 
 @available(iOS 14, *)
-public struct OperationView<TResponse, TVariables, Content>: View where Content: View, TVariables: Codable {
-    @EnvironmentObject var environment: Environment;
+public struct OperationView<TOperation: Operation, TContent: View>: View where TOperation.TVariables: Encodable {
+    let operation: TOperation;
+    let contentProvider: (AmphionOperationState<TOperation.TResponse>) -> TContent;
     
-    var operation: Operation<TResponse, TVariables>;
-    var variables: TVariables;
-    
-    var content: (AmphionOperationState<TResponse>) -> Content;
-    @State private var state: AmphionOperationState<TResponse> = AmphionOperationState.Loading;
-    
-    private var cancellable: (() -> Void)?;
-
+    public init(operation: TOperation, contentProvider: @escaping (AmphionOperationState<TOperation.TResponse>) -> TContent) {
+        self.operation = operation;
+        self.contentProvider = contentProvider
+    }
     
     public var body: some View {
-        return content(self.state).onAppear(perform: self.appear).onDisappear()
+        return OperationViewImpl<TOperation, TContent>(operation: operation, contentProvider: contentProvider);
+    }
+}
+
+
+private struct OperationViewImpl<TOperation: Operation, TContent: View>: View where TOperation.TVariables: Encodable {
+    @EnvironmentObject var environment: Environment;
+
+    
+    @State private var state: AmphionOperationState<TOperation.TResponse> = AmphionOperationState.Loading;
+    @State var cancellable: (() -> Void)?;
+    
+    let operation: TOperation;
+    let contentProvider: (AmphionOperationState<TOperation.TResponse>) -> TContent;
+    
+    
+    public var body: some View {
+        return contentProvider(self.state).onAppear(perform: self.appear).onDisappear(perform: self.disappear);
     }
     
     func appear() {
-        let _cancellable = environment.network.handleOperation(operation: operation, variables: variables) { state in
+        self.cancellable = environment.network.handleOperation(operation: self.operation) { state in
             self.state = state;
         };
+    }
+    
+    func disappear() {
+        if let cancellable = self.cancellable {
+            cancellable();
+        }
     }
 }
