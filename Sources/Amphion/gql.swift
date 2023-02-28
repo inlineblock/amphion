@@ -16,12 +16,3 @@ import SwiftUI
     self.wrappedValue = wrappedValue
   }
 }
-
-@propertyWrapper public struct useFragment<TFragment: WithId>: DynamicProperty where TFragment : WithId  {
-  @StateObject public var wrappedValue: TFragment;
-  @EnvironmentObject public var environment: Amphion.Environment;
-  
-  public init(wrappedValue: TFragment) {
-    self._wrappedValue = StateObject(wrappedValue: wrappedValue);
-  }
-}
